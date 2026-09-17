@@ -199,3 +199,147 @@ def test_flag_crud_lifecycle(client):
     assert "lifecycle" in keys
     assert client.delete("/api/v1/flags/lifecycle").status_code == 204
     assert client.get("/api/v1/flags/lifecycle").status_code == 404
+
+
+def _update_btn_color_v2(client):
+    """把 simple_flag 更新为下一版本：规则指向 blue，权重 20/80。返回新版本号。"""
+    update = {
+        "flag_key": "btn_color",
+        "description": "v2",
+        "variants": [
+            {"key": "red", "weight": 20},
+            {"key": "blue", "weight": 80},
+        ],
+        "rules": [
+            {
+                "priority": 1,
+                "attribute": "region",
+                "operator": "eq",
+                "values": ["cn"],
+                "variant_key": "blue",
+            }
+        ],
+    }
+    resp = client.post("/api/v1/flags", json=update)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["version"]
+
+
+def test_versions_list_and_immutable_history(client, simple_flag):
+    assert _update_btn_color_v2(client) == 2
+
+    resp = client.get("/api/v1/flags/btn_color/versions")
+    assert resp.status_code == 200, resp.text
+    versions = resp.json()
+    assert [v["version"] for v in versions] == [1, 2]
+
+    v1 = client.get("/api/v1/flags/btn_color/versions/1").json()
+    assert v1["description"] == "按钮颜色实验"
+    assert v1["rules"][0]["variant_key"] == "red"
+    assert {v["key"]: v["weight"] for v in v1["variants"]} == {"red": 50, "blue": 50}
+
+    v2 = client.get("/api/v1/flags/btn_color/versions/2").json()
+    assert v2["description"] == "v2"
+    assert v2["rules"][0]["variant_key"] == "blue"
+    assert {v["key"]: v["weight"] for v in v2["variants"]} == {"red": 20, "blue": 80}
+
+    # 再次更新后，历史版本仍保持不变
+    assert _update_btn_color_v2(client) == 3  # 内容同 v2
+    v1_again = client.get("/api/v1/flags/btn_color/versions/1").json()
+    assert v1_again["rules"][0]["variant_key"] == "red"
+    assert {v["key"]: v["weight"] for v in v1_again["variants"]} == {"red": 50, "blue": 50}
+    assert [v["version"] for v in client.get("/api/v1/flags/btn_color/versions").json()] == [1, 2, 3]
+
+
+def test_versions_unknown_flag_or_version_404(client, simple_flag):
+    assert client.get("/api/v1/flags/ghost/versions").status_code == 404
+    assert client.get("/api/v1/flags/ghost/versions/1").status_code == 404
+    assert client.get("/api/v1/flags/btn_color/versions/99").status_code == 404
+
+
+def test_versions_removed_with_flag(client, simple_flag):
+    assert client.delete("/api/v1/flags/btn_color").status_code == 204
+    assert client.get("/api/v1/flags/btn_color/versions").status_code == 404
+    assert client.get("/api/v1/flags/btn_color/versions/1").status_code == 404
+
+
+def test_evaluate_with_config_version_uses_historical_rules(client, simple_flag):
+    _update_btn_color_v2(client)
+
+    # 最新版（v2）：region=cn 命中规则 -> blue
+    latest = client.post(
+        "/api/v1/flags/btn_color/evaluate",
+        json={"user_id": "u1", "context": {"region": "cn"}},
+    ).json()
+    assert latest["config_version"] == 2
+    assert latest["variant_key"] == "blue"
+    assert latest["matched_rule"]["variant_key"] == "blue"
+
+    # 指定 v1：同一请求按旧规则判定 -> red
+    pinned = client.post(
+        "/api/v1/flags/btn_color/evaluate",
+        json={"user_id": "u1", "context": {"region": "cn"}, "config_version": 1},
+    ).json()
+    assert pinned["config_version"] == 1
+    assert pinned["variant_key"] == "red"
+    assert pinned["matched_rule"]["variant_key"] == "red"
+
+    # 快照里记录的也是判定所用版本
+    snap = client.get(f"/api/v1/decisions/{pinned['request_id']}").json()
+    assert snap["config_version"] == 1
+    assert snap["variant_key"] == "red"
+
+
+def test_evaluate_with_config_version_uses_historical_weights(client, simple_flag):
+    _update_btn_color_v2(client)  # v2: red 20 / blue 80；v1: 50/50
+
+    def bucket_variant(version_body):
+        return client.post(
+            "/api/v1/flags/btn_color/evaluate",
+            json={"user_id": "u1", "context": {}, **version_body},
+        ).json()
+
+    bucket = stable_bucket("btn_color", "u1")
+    expected_v1 = "red" if bucket < 50 else "blue"
+    expected_v2 = "red" if bucket < 20 else "blue"
+    assert bucket_variant({"config_version": 1})["variant_key"] == expected_v1
+    assert bucket_variant({"config_version": 2})["variant_key"] == expected_v2
+    assert bucket_variant({})["variant_key"] == expected_v2  # 缺省用最新版
+
+
+def test_evaluate_unknown_config_version_404(client, simple_flag):
+    resp = client.post(
+        "/api/v1/flags/btn_color/evaluate",
+        json={"user_id": "u1", "config_version": 99},
+    )
+    assert resp.status_code == 404
+    # 请求体路径式判定同样支持
+    resp = client.post(
+        "/api/v1/evaluate",
+        json={"flag_key": "btn_color", "user_id": "u1", "config_version": 99},
+    )
+    assert resp.status_code == 404
+
+
+def test_idempotent_replay_after_update_returns_first_result(client, simple_flag):
+    payload = {
+        "user_id": "u1",
+        "context": {"region": "cn"},
+        "request_id": "replay-after-update",
+    }
+    first = client.post("/api/v1/flags/btn_color/evaluate", json=payload).json()
+    assert first["config_version"] == 1
+    assert first["variant_key"] == "red"
+
+    _update_btn_color_v2(client)  # v2 中同一 context 命中规则 -> blue
+
+    # 重放：即便指定了别的 config_version，也必须返回首次结果
+    second = client.post(
+        "/api/v1/flags/btn_color/evaluate",
+        json={**payload, "config_version": 2},
+    ).json()
+    assert second["request_id"] == "replay-after-update"
+    assert second["config_version"] == 1
+    assert second["variant_key"] == "red"
+    assert second["matched_rule"]["variant_key"] == "red"
+    assert second["explanation"] == first["explanation"]

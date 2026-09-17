@@ -10,6 +10,7 @@
 - 规则所需属性**缺失（或值为 `null`）一律视为未命中**，继续判定下一条；
 - 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
 - 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
+- 每次创建 / 更新在同一事务中落一条**不可变配置版本**，可查询历史版本，判定也可指定按某个历史版本执行；
 - 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
 
 ## 一条命令启动
@@ -55,12 +56,14 @@ curl -sS http://localhost:8000/api/v1/decisions/<request_id>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`） |
+| `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`，同事务落不可变版本） |
 | `GET` | `/api/v1/flags` | 列出全部开关 |
 | `GET` | `/api/v1/flags/{flag_key}` | 查看单个开关 |
-| `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关 |
-| `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中） |
-| `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
+| `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关（连同其版本历史） |
+| `GET` | `/api/v1/flags/{flag_key}/versions` | 列出该开关的全部配置版本 |
+| `GET` | `/api/v1/flags/{flag_key}/versions/{version}` | 查看指定历史版本的完整配置 |
+| `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中；可指定 `config_version`） |
+| `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中；可指定 `config_version`） |
 | `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
 | `GET` | `/healthz` | 健康检查 |
 
@@ -89,6 +92,44 @@ curl -sS -X POST http://localhost:8000/api/v1/flags \
 - 变体权重之和必须恰好为 `100`，权重允许为 `0`（该变体永不被分桶选中）；变体 key 不可重复；
 - 规则 `priority` 不可重复（数字越小越先判定）；
 - 规则的 `variant_key` 必须是已配置的变体。
+
+### 配置版本（不可变历史）
+
+每次创建 / 更新都会在**同一事务**中写入一条不可变版本记录（`flag_key + version` 唯一），历史版本随后续更新保持不变：
+
+```bash
+# 列出版本历史（按 version 升序）
+curl -sS http://localhost:8000/api/v1/flags/btn_color/versions
+
+# 查看某个历史版本的完整配置
+curl -sS http://localhost:8000/api/v1/flags/btn_color/versions/1
+```
+
+响应示例：
+
+```json
+{
+  "flag_key": "btn_color",
+  "version": 1,
+  "description": "按钮颜色实验",
+  "variants": [{"key": "red", "weight": 20, "description": ""}, {"key": "blue", "weight": 80, "description": ""}],
+  "rules": [{"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "red"}],
+  "created_at": "2026-09-17T08:00:00Z"
+}
+```
+
+开关或版本不存在时返回 `404`；删除开关会一并删除其版本历史（判定快照不受影响）。
+
+### 按指定版本判定
+
+判定请求可携带可选的 `config_version`：指定时使用**该历史版本的规则与权重**计算，并把该版本写入判定快照；不指定时使用最新版本。版本不存在返回 `404`。
+
+```bash
+# 按 v1 的规则与权重判定（响应与快照中的 config_version 均为 1）
+curl -sS -X POST http://localhost:8000/api/v1/flags/btn_color/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-1001","context":{"region":"cn"},"config_version":1}'
+```
 
 ### 规则操作符
 
@@ -129,7 +170,7 @@ curl -sS -X POST http://localhost:8000/api/v1/flags \
 
 ### 幂等
 
-判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 会命中不同规则），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
+判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 会命中不同规则、或指定了不同的 `config_version`），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
 
 ## 分桶算法
 
@@ -147,10 +188,10 @@ bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
 │   ├── main.py        # FastAPI 路由、错误处理、幂等、种子数据
 │   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
 │   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
-│   ├── crud.py        # 配置与快照持久化
-│   ├── models.py      # SQLAlchemy ORM（flag_configs / decision_snapshots）
+│   ├── crud.py        # 配置、版本与快照持久化
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / flag_config_versions / decision_snapshots）
 │   └── database.py    # 引擎与会话
-├── tests/             # pytest：引擎单测 + API 集成测试（26 项）
+├── tests/             # pytest：引擎单测 + API 集成测试（33 项）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -167,4 +208,5 @@ python -m pytest -q
 
 - 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
 - 判定快照只增不删（删除开关不影响历史快照回查）；
-- 快照保存的是判定时的 `config_version`；若配置已更新，旧快照按 `request_id` 回查时返回的是**当时的解释链**，而重建的 `matched_rule` 详情取自当前版本配置。
+- 配置版本自创建起不可变；快照保存的是判定时的 `config_version`，按 `request_id` 回查 / 重放时返回当时的解释链，`matched_rule` 详情也按该历史版本重建；
+- 从旧版本升级时，`flag_config_versions` 表会自动创建；升级前已存在的开关从下一次创建 / 更新起开始累积版本历史。

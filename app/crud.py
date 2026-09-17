@@ -3,11 +3,11 @@
 import json
 from collections.abc import Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app import engine as eng
-from app.models import DecisionSnapshot, FlagConfig
+from app.models import DecisionSnapshot, FlagConfig, FlagConfigVersion
 from app.schemas import FlagUpsertRequest, RuleIn, VariantIn
 
 
@@ -24,7 +24,10 @@ def parse_variants(raw: str) -> list[eng.Variant]:
 
 
 def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
-    """创建开关；已存在时版本号 +1 并整体覆盖规则/变体。"""
+    """创建开关；已存在时版本号 +1 并整体覆盖规则/变体。
+
+    同一事务内写入一条不可变的 FlagConfigVersion，历史版本随后续更新保持不变。
+    """
     rules_json = json.dumps(
         [r.model_dump() for r in sorted(payload.rules, key=lambda x: x.priority)],
         ensure_ascii=False,
@@ -46,6 +49,15 @@ def upsert_flag(db: Session, payload: FlagUpsertRequest) -> FlagConfig:
         flag.rules_json = rules_json
         flag.variants_json = variants_json
         flag.version += 1
+    db.add(
+        FlagConfigVersion(
+            flag_key=payload.flag_key,
+            version=flag.version,
+            description=payload.description,
+            rules_json=rules_json,
+            variants_json=variants_json,
+        )
+    )
     db.commit()
     db.refresh(flag)
     return flag
@@ -63,9 +75,41 @@ def delete_flag(db: Session, flag_key: str) -> bool:
     flag = get_flag_or_none(db, flag_key)
     if flag is None:
         return False
+    # 版本历史随开关一起删除（判定快照不受影响，仍可回查）
+    db.execute(delete(FlagConfigVersion).where(FlagConfigVersion.flag_key == flag_key))
     db.delete(flag)
     db.commit()
     return True
+
+
+def list_flag_versions(db: Session, flag_key: str) -> Sequence[FlagConfigVersion]:
+    return db.scalars(
+        select(FlagConfigVersion)
+        .where(FlagConfigVersion.flag_key == flag_key)
+        .order_by(FlagConfigVersion.version)
+    ).all()
+
+
+def get_flag_version(db: Session, flag_key: str, version: int) -> FlagConfigVersion | None:
+    return db.scalar(
+        select(FlagConfigVersion).where(
+            FlagConfigVersion.flag_key == flag_key,
+            FlagConfigVersion.version == version,
+        )
+    )
+
+
+def version_to_response(row: FlagConfigVersion) -> dict:
+    rules = [RuleIn(**item) for item in json.loads(row.rules_json)]
+    variants = [VariantIn(**item) for item in json.loads(row.variants_json)]
+    return {
+        "flag_key": row.flag_key,
+        "version": row.version,
+        "description": row.description,
+        "variants": variants,
+        "rules": rules,
+        "created_at": row.created_at,
+    }
 
 
 def flag_to_response(flag: FlagConfig) -> dict:
@@ -86,17 +130,18 @@ def save_snapshot(
     db: Session,
     *,
     request_id: str,
-    flag: FlagConfig,
+    flag_key: str,
+    config_version: int,
     user_id: str,
     context: dict,
     decision: eng.Decision,
 ) -> DecisionSnapshot:
     snapshot = DecisionSnapshot(
         request_id=request_id,
-        flag_key=flag.flag_key,
+        flag_key=flag_key,
         user_id=user_id,
         request_context_json=json.dumps(context, ensure_ascii=False, sort_keys=True),
-        config_version=flag.version,
+        config_version=config_version,
         bucket_value=decision.bucket_value,
         matched_rule_index=decision.matched_rule_index,
         variant_key=decision.variant_key,
