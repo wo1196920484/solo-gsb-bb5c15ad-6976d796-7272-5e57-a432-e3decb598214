@@ -1,0 +1,170 @@
+# Feature Flag Decision API
+
+供本地应用调用的功能开关判定服务（Python + FastAPI + SQLite）。
+
+每个开关包含：
+
+- **有序属性规则**：按 `priority` 升序判定，返回**首个命中**规则指定的变体；
+- **多个加权变体**：无规则命中时，以 `flag_key` 与 `user_id` 做稳定哈希，映射到 `0-99` 桶，按权重区间选择变体；
+- 变体**权重总和必须为 100**；
+- 规则所需属性**缺失（或值为 `null`）一律视为未命中**，继续判定下一条；
+- 同一用户在配置不变时判定结果**稳定**（哈希输入只有 `flag_key:user_id`）；
+- 判定响应包含**命中规则、分桶值、最终变体的完整解释链**；
+- 每次判定落库为快照，可按 `request_id` 回查；支持 `request_id` **幂等重放**。
+
+## 一条命令启动
+
+```bash
+docker compose up --build
+```
+
+服务在 http://localhost:8000 启动，SQLite 数据保存在 Docker 卷 `flag-data` 中。
+
+- Swagger 文档：http://localhost:8000/docs
+- 健康检查：http://localhost:8000/healthz
+- 首次启动自动写入演示开关 `new_checkout`（员工 / 白名单地区走规则，其余 90/10 分桶）。
+
+不使用容器时（需 Python 3.11+）：
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+可通过环境变量 `DATABASE_URL` 覆盖数据库位置，默认 `./data/flags.db`。
+
+## 快速体验
+
+```bash
+# 1) 无规则命中 -> 稳定哈希分桶（同一 user_id 多次调用结果一致）
+curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-1001","context":{}}'
+
+# 2) priority=1 的 employee 规则命中（属性缺失时该规则视为未命中）
+curl -sS -X POST http://localhost:8000/api/v1/flags/new_checkout/evaluate \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"user-1001","context":{"employee":true,"region":"us"}}'
+
+# 3) 用返回的 request_id 查询判定快照
+curl -sS http://localhost:8000/api/v1/decisions/<request_id>
+```
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/api/v1/flags` | 创建 / 更新开关（已存在则 `version + 1`） |
+| `GET` | `/api/v1/flags` | 列出全部开关 |
+| `GET` | `/api/v1/flags/{flag_key}` | 查看单个开关 |
+| `DELETE` | `/api/v1/flags/{flag_key}` | 删除开关 |
+| `POST` | `/api/v1/flags/{flag_key}/evaluate` | 判定（推荐，flag_key 在路径中） |
+| `POST` | `/api/v1/evaluate` | 判定（flag_key 在请求体中） |
+| `GET` | `/api/v1/decisions/{request_id}` | 按 request_id 查询判定快照 |
+| `GET` | `/healthz` | 健康检查 |
+
+### 创建开关
+
+```bash
+curl -sS -X POST http://localhost:8000/api/v1/flags \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "flag_key": "btn_color",
+    "description": "按钮颜色实验",
+    "variants": [
+      {"key": "red",  "weight": 20},
+      {"key": "blue", "weight": 80}
+    ],
+    "rules": [
+      {"priority": 1, "attribute": "region",   "operator": "eq", "values": ["cn"], "variant_key": "red"},
+      {"priority": 2, "attribute": "age",      "operator": "gte", "values": [65],  "variant_key": "red"},
+      {"priority": 3, "attribute": "user_tier","operator": "in",  "values": ["vip","svip"], "variant_key": "blue"}
+    ]
+  }'
+```
+
+校验规则（不满足返回 `422`）：
+
+- 变体权重之和必须恰好为 `100`，权重允许为 `0`（该变体永不被分桶选中）；变体 key 不可重复；
+- 规则 `priority` 不可重复（数字越小越先判定）；
+- 规则的 `variant_key` 必须是已配置的变体。
+
+### 规则操作符
+
+| operator | 语义 | values 用法 |
+| --- | --- | --- |
+| `eq` / `ne` | 等于 / 不等于 | 取 `values[0]` |
+| `in` / `not_in` | 属于 / 不属于集合 | 整个 `values` |
+| `gt` / `gte` / `lt` / `lte` | 数值比较 | 取 `values[0]`，两侧非数字视为未命中 |
+| `prefix` / `suffix` / `contains` | 字符串前缀 / 后缀 / 包含 | 取 `values[0]`，两侧非字符串视为未命中 |
+
+属性不存在、值为 `null`、或类型不兼容时，该规则**记为未命中并附原因**，继续判定后续规则。
+
+### 判定响应与解释链
+
+```json
+{
+  "request_id": "7f7c0807-...",
+  "flag_key": "btn_color",
+  "user_id": "user-1001",
+  "config_version": 1,
+  "matched_rule": null,
+  "bucket_value": 42,
+  "variant_key": "blue",
+  "decision_path": "bucket",
+  "explanation": [
+    {"step": "rules_loaded", "detail": {"rule_count": 3, "evaluation_order": ["..."]}},
+    {"step": "rule_evaluated", "detail": {"rule_index": 0, "result": "miss", "reason": "缺少属性 'region'，视为未命中"}},
+    {"step": "no_rule_matched", "detail": {"reason": "所有规则均未命中，进入哈希分桶"}},
+    {"step": "bucket_computed", "detail": {"hash_input": "btn_color:user-1001", "algorithm": "sha256[:8] % 100", "bucket_value": 42}},
+    {"step": "variant_selected", "detail": {"selected_variant": "blue", "selected_range": [20, 100], "variant_ranges": ["..."]}}
+  ]
+}
+```
+
+- `decision_path = "rule"` 时 `matched_rule` 为命中规则、`bucket_value` 为 `null`；
+- `decision_path = "bucket"` 时 `matched_rule` 为 `null`，`bucket_value` 为 `0-99`；
+- 配置更新会使 `config_version` 自增；**同一版本配置下，同一 `flag_key + user_id` 永远落入同一桶**。
+
+### 幂等
+
+判定请求可携带自定义 `request_id`。同一 `request_id` 的重复请求直接返回**首次判定快照**（即使第二次 context 会命中不同规则），适合客户端超时重试。若同一 `request_id` 搭配了不同的 `flag_key/user_id`，返回 `409`。不携带时服务自动生成 UUID。
+
+## 分桶算法
+
+```
+bucket = int.from_bytes(sha256(f"{flag_key}:{user_id}")[:8], "big") % 100
+```
+
+随后按变体配置顺序累加权重切分 `[0, 100)`：上例中桶 `0-19` → `red`（20%），`20-99` → `blue`（80%）。变体顺序或权重变化即视为配置发布（`version` 自增），此前的稳定性不再保证——这是刻意的设计：发布即重新分桶。
+
+## 项目结构
+
+```
+.
+├── app/
+│   ├── main.py        # FastAPI 路由、错误处理、幂等、种子数据
+│   ├── engine.py      # 规则判定 + 稳定哈希分桶 + 解释链（纯函数，易测）
+│   ├── schemas.py     # Pydantic 请求/响应模型与配置校验
+│   ├── crud.py        # 配置与快照持久化
+│   ├── models.py      # SQLAlchemy ORM（flag_configs / decision_snapshots）
+│   └── database.py    # 引擎与会话
+├── tests/             # pytest：引擎单测 + API 集成测试（26 项）
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+## 运行测试
+
+```bash
+pip install -r requirements.txt pytest httpx
+python -m pytest -q
+```
+
+## 说明与边界
+
+- 服务定位为**本地 / 单机**使用：SQLite + 单实例，未做多副本一致性；
+- 判定快照只增不删（删除开关不影响历史快照回查）；
+- 快照保存的是判定时的 `config_version`；若配置已更新，旧快照按 `request_id` 回查时返回的是**当时的解释链**，而重建的 `matched_rule` 详情取自当前版本配置。
