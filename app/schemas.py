@@ -71,6 +71,17 @@ class FlagResponse(BaseModel):
     updated_at: Any
 
 
+class FlagVersionResponse(BaseModel):
+    """某一历史版本的完整不可变配置。"""
+
+    flag_key: str
+    version: int
+    description: str
+    variants: list[VariantIn]
+    rules: list[RuleIn]
+    created_at: Any
+
+
 class EvaluateRequest(BaseModel):
     flag_key: str | None = Field(default=None, max_length=128, description="路径式调用可省略")
     user_id: str = Field(min_length=1, max_length=128)
@@ -78,6 +89,9 @@ class EvaluateRequest(BaseModel):
         default_factory=dict, description="用户属性，规则按此匹配，如 {\"region\": \"cn\", \"age\": 20}"
     )
     request_id: str | None = Field(default=None, max_length=64, description="可选，幂等用；缺省自动生成")
+    config_version: int | None = Field(
+        default=None, ge=1, description="可选，指定使用的历史配置版本；缺省使用最新版"
+    )
 
 
 class ExplanationStep(BaseModel):

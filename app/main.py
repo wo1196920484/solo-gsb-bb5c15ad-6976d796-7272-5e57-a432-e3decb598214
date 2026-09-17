@@ -1,11 +1,13 @@
 """FastAPI 入口：功能开关判定服务。
 
 路由：
-- POST /api/v1/flags              创建/更新开关配置（已存在则 version+1）
+- POST /api/v1/flags              创建/更新开关配置（已存在则 version+1，同事务保存不可变版本）
 - GET  /api/v1/flags              列出全部开关
 - GET  /api/v1/flags/{flag_key}   查看单个开关
-- DELETE /api/v1/flags/{flag_key} 删除开关
-- POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key）
+- DELETE /api/v1/flags/{flag_key} 删除开关（版本历史一并删除）
+- GET  /api/v1/flags/{flag_key}/versions            列出版本历史
+- GET  /api/v1/flags/{flag_key}/versions/{version}  查看指定版本配置
+- POST /api/v1/flags/{flag_key}/evaluate  判定（按路径中的 flag_key，可指定 config_version）
 - POST /api/v1/evaluate           判定（flag_key 在请求体中）
 - GET  /api/v1/decisions/{request_id}     按 request_id 查询判定快照
 - GET  /healthz                   健康检查
@@ -24,12 +26,23 @@ from app import crud
 from app.database import Base, engine, get_db
 from app.engine import RuleEvaluationError, decide
 from app.models import FlagConfig
-from app.schemas import EvaluateRequest, EvaluateResponse, FlagResponse, FlagUpsertRequest
+from app.schemas import (
+    EvaluateRequest,
+    EvaluateResponse,
+    FlagResponse,
+    FlagUpsertRequest,
+    FlagVersionResponse,
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    db = next(get_db())
+    try:
+        crud.backfill_missing_versions(db)
+    finally:
+        db.close()
     _seed_demo_flags()
     yield
 
@@ -98,28 +111,36 @@ def _snapshot_to_response(snap, *, request_context: dict | None = None) -> dict:
     }
 
 
-def _replay_response(snap, flag: FlagConfig, req: EvaluateRequest) -> EvaluateResponse:
-    """从快照重建判定响应（幂等重试场景）。"""
+def _replay_response(
+    db: Session, snap, flag: FlagConfig, req: EvaluateRequest
+) -> EvaluateResponse:
+    """从快照重建判定响应（幂等重试场景）。
+
+    matched_rule 详情优先取快照记录的 config_version 对应的历史版本配置，
+    版本记录缺失（如开关被删除重建）时回退到当前配置。
+    """
     body = _snapshot_to_response(snap, request_context=req.context)
     matched_rule = None
     if snap.matched_rule_index is not None:
-        rules = crud.parse_rules(flag.rules_json)
-        r = rules[snap.matched_rule_index]
-        matched_rule = {
-            "rule_index": snap.matched_rule_index,
-            "priority": r.priority,
-            "attribute": r.attribute,
-            "operator": r.operator,
-            "values": r.values,
-            "variant_key": r.variant_key,
-        }
+        ver = crud.get_flag_version(db, snap.flag_key, snap.config_version)
+        rules = crud.parse_rules(ver.rules_json if ver is not None else flag.rules_json)
+        if 0 <= snap.matched_rule_index < len(rules):
+            r = rules[snap.matched_rule_index]
+            matched_rule = {
+                "rule_index": snap.matched_rule_index,
+                "priority": r.priority,
+                "attribute": r.attribute,
+                "operator": r.operator,
+                "values": r.values,
+                "variant_key": r.variant_key,
+            }
     body["matched_rule"] = matched_rule
     allowed = EvaluateResponse.model_fields
     return EvaluateResponse(**{k: v for k, v in body.items() if k in allowed})
 
 
 def _decision_response(
-    request_id: str, flag: FlagConfig, req: EvaluateRequest, decision
+    request_id: str, flag: FlagConfig, req: EvaluateRequest, decision, config_version: int
 ) -> EvaluateResponse:
     matched_rule = None
     if decision.matched_rule is not None:
@@ -136,7 +157,7 @@ def _decision_response(
         request_id=request_id,
         flag_key=flag.flag_key,
         user_id=req.user_id,
-        config_version=flag.version,
+        config_version=config_version,
         matched_rule=matched_rule,
         bucket_value=decision.bucket_value,
         variant_key=decision.variant_key,
@@ -183,6 +204,26 @@ def delete_flag(flag_key: str, db: Session = Depends(get_db)) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
 
 
+@app.get("/api/v1/flags/{flag_key}/versions", response_model=list[FlagVersionResponse])
+def list_flag_versions(flag_key: str, db: Session = Depends(get_db)):
+    if crud.get_flag_or_none(db, flag_key) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    return [crud.version_to_response(v) for v in crud.list_flag_versions(db, flag_key)]
+
+
+@app.get("/api/v1/flags/{flag_key}/versions/{version}", response_model=FlagVersionResponse)
+def get_flag_version(flag_key: str, version: int, db: Session = Depends(get_db)):
+    if crud.get_flag_or_none(db, flag_key) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"开关 {flag_key!r} 不存在")
+    ver = crud.get_flag_version(db, flag_key, version)
+    if ver is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"开关 {flag_key!r} 没有版本 {version}",
+        )
+    return crud.version_to_response(ver)
+
+
 def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateResponse:
     flag = crud.get_flag_or_none(db, flag_key)
     if flag is None:
@@ -200,17 +241,32 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"request_id={request_id} 已用于其他判定（flag_key/user_id 不一致）",
             )
-        return _replay_response(existing, flag, req)
+        return _replay_response(db, existing, flag, req)
 
-    rules = crud.parse_rules(flag.rules_json)
-    variants = crud.parse_variants(flag.variants_json)
+    # 解析本次判定使用的配置版本：缺省用最新版，指定时必须存在
+    if req.config_version is None:
+        rules_json, variants_json = flag.rules_json, flag.variants_json
+        config_version = flag.version
+    else:
+        ver = crud.get_flag_version(db, flag_key, req.config_version)
+        if ver is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"开关 {flag_key!r} 没有版本 {req.config_version}",
+            )
+        rules_json, variants_json = ver.rules_json, ver.variants_json
+        config_version = ver.version
+
+    rules = crud.parse_rules(rules_json)
+    variants = crud.parse_variants(variants_json)
     decision = decide(flag.flag_key, req.user_id, req.context, variants, rules)
 
     try:
         crud.save_snapshot(
             db,
             request_id=request_id,
-            flag=flag,
+            flag_key=flag.flag_key,
+            config_version=config_version,
             user_id=req.user_id,
             context=req.context,
             decision=decision,
@@ -220,10 +276,10 @@ def _evaluate(req: EvaluateRequest, db: Session, flag_key: str) -> EvaluateRespo
         db.rollback()
         existing = crud.get_snapshot(db, request_id)
         if existing is not None:
-            return _replay_response(existing, flag, req)
+            return _replay_response(db, existing, flag, req)
         raise
 
-    return _decision_response(request_id, flag, req, decision)
+    return _decision_response(request_id, flag, req, decision, config_version)
 
 
 @app.post("/api/v1/evaluate", response_model=EvaluateResponse)

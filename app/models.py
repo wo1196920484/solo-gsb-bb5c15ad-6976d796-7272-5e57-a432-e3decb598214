@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -30,6 +30,27 @@ class FlagConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
     )
+
+
+class FlagConfigVersion(Base):
+    """开关配置的不可变历史版本。
+
+    每次创建 / 更新开关时，在同一事务中追加一行完整配置快照；
+    历史行只增不改，判定可按 version 精确重放当时的规则与权重。
+    """
+
+    __tablename__ = "flag_config_versions"
+    __table_args__ = (
+        UniqueConstraint("flag_key", "version", name="uq_flag_config_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    flag_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[str] = mapped_column(String(512), default="")
+    rules_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    variants_json: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class DecisionSnapshot(Base):

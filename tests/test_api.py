@@ -199,3 +199,178 @@ def test_flag_crud_lifecycle(client):
     assert "lifecycle" in keys
     assert client.delete("/api/v1/flags/lifecycle").status_code == 204
     assert client.get("/api/v1/flags/lifecycle").status_code == 404
+
+
+def _versioned_flag(client):
+    """创建 v1（region=cn -> a，权重 a/b 各 50），再更新为 v2（region=cn -> b，a=0/b=100）。"""
+    v1 = {
+        "flag_key": "ver_flag",
+        "description": "v1",
+        "variants": [{"key": "a", "weight": 50}, {"key": "b", "weight": 50}],
+        "rules": [
+            {"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "a"}
+        ],
+    }
+    assert client.post("/api/v1/flags", json=v1).status_code == 201
+    v2 = {
+        "flag_key": "ver_flag",
+        "description": "v2",
+        "variants": [{"key": "a", "weight": 0}, {"key": "b", "weight": 100}],
+        "rules": [
+            {"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "b"}
+        ],
+    }
+    assert client.post("/api/v1/flags", json=v2).status_code == 201
+    return v1, v2
+
+
+def test_versions_listed_and_immutable(client):
+    v1, v2 = _versioned_flag(client)
+
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2]
+    assert versions[0]["description"] == "v1"
+    assert versions[0]["rules"][0]["variant_key"] == "a"
+    assert versions[1]["description"] == "v2"
+    assert versions[1]["rules"][0]["variant_key"] == "b"
+
+    # 再次更新为 v3 后，历史版本内容保持不变
+    v3 = dict(v2, description="v3")
+    assert client.post("/api/v1/flags", json=v3).status_code == 201
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1, 2, 3]
+    assert versions[0]["description"] == "v1"
+    assert versions[0]["rules"][0]["variant_key"] == "a"
+    assert versions[0]["variants"][0]["weight"] == 50
+
+
+def test_get_specific_version(client):
+    _versioned_flag(client)
+    resp = client.get("/api/v1/flags/ver_flag/versions/1")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["version"] == 1
+    assert body["rules"][0]["variant_key"] == "a"
+    assert {v["key"]: v["weight"] for v in body["variants"]} == {"a": 50, "b": 50}
+
+    assert client.get("/api/v1/flags/ver_flag/versions/99").status_code == 404
+
+
+def test_versions_unknown_flag_404(client):
+    assert client.get("/api/v1/flags/nope/versions").status_code == 404
+    assert client.get("/api/v1/flags/nope/versions/1").status_code == 404
+
+
+def test_evaluate_with_config_version_uses_historical_rules(client):
+    _versioned_flag(client)
+    ctx = {"region": "cn"}
+
+    latest = client.post(
+        "/api/v1/flags/ver_flag/evaluate", json={"user_id": "u1", "context": ctx}
+    ).json()
+    assert latest["variant_key"] == "b"
+    assert latest["config_version"] == 2
+
+    pinned = client.post(
+        "/api/v1/flags/ver_flag/evaluate",
+        json={"user_id": "u1", "context": ctx, "config_version": 1},
+    ).json()
+    assert pinned["variant_key"] == "a"
+    assert pinned["config_version"] == 1
+    assert pinned["matched_rule"]["variant_key"] == "a"
+
+    # 快照记录的也是判定所用版本
+    snap = client.get(f"/api/v1/decisions/{pinned['request_id']}").json()
+    assert snap["config_version"] == 1
+
+
+def test_evaluate_with_config_version_uses_historical_weights(client):
+    _versioned_flag(client)
+    # v1 权重 a/b 各 50，v2 为 a=0/b=100；无规则上下文走分桶
+    for i in range(20):
+        user = f"bucketer-{i}"
+        v1_body = client.post(
+            "/api/v1/flags/ver_flag/evaluate",
+            json={"user_id": user, "context": {}, "config_version": 1},
+        ).json()
+        v2_body = client.post(
+            "/api/v1/flags/ver_flag/evaluate",
+            json={"user_id": user, "context": {}, "config_version": 2},
+        ).json()
+        assert v2_body["variant_key"] == "b"  # v2 中 a 权重为 0
+        assert v1_body["config_version"] == 1
+        assert v2_body["config_version"] == 2
+        # 同一用户分桶值与版本无关（哈希输入只有 flag_key/user_id）
+        assert v1_body["bucket_value"] == v2_body["bucket_value"]
+
+
+def test_evaluate_with_unknown_config_version_404(client, simple_flag):
+    resp = client.post(
+        "/api/v1/flags/btn_color/evaluate",
+        json={"user_id": "u1", "context": {}, "config_version": 99},
+    )
+    assert resp.status_code == 404
+
+
+def test_idempotent_replay_with_config_version(client):
+    _versioned_flag(client)
+    payload = {
+        "user_id": "u1",
+        "context": {"region": "cn"},
+        "request_id": "ver-req-001",
+        "config_version": 1,
+    }
+    first = client.post("/api/v1/flags/ver_flag/evaluate", json=payload).json()
+    assert first["variant_key"] == "a"
+    assert first["config_version"] == 1
+
+    # 同一 request_id 重放：即使指定了其他版本，也返回首次结果
+    payload["config_version"] = 2
+    second = client.post("/api/v1/flags/ver_flag/evaluate", json=payload).json()
+    assert second["request_id"] == "ver-req-001"
+    assert second["variant_key"] == first["variant_key"]
+    assert second["config_version"] == first["config_version"]
+    assert second["explanation"] == first["explanation"]
+
+
+def test_replay_matched_rule_uses_snapshot_version(client):
+    _versioned_flag(client)
+    body = client.post(
+        "/api/v1/flags/ver_flag/evaluate",
+        json={"user_id": "u1", "context": {"region": "cn"}, "request_id": "ver-req-002"},
+    ).json()
+    assert body["matched_rule"]["variant_key"] == "b"  # 当时最新为 v2
+
+    # 更新为 v3（规则指向 a）后重放，matched_rule 仍按快照版本 v2 重建
+    v3 = {
+        "flag_key": "ver_flag",
+        "variants": [{"key": "a", "weight": 50}, {"key": "b", "weight": 50}],
+        "rules": [
+            {"priority": 1, "attribute": "region", "operator": "eq", "values": ["cn"], "variant_key": "a"}
+        ],
+    }
+    assert client.post("/api/v1/flags", json=v3).status_code == 201
+    replay = client.post(
+        "/api/v1/flags/ver_flag/evaluate",
+        json={"user_id": "u1", "context": {"region": "cn"}, "request_id": "ver-req-002"},
+    ).json()
+    assert replay["variant_key"] == "b"
+    assert replay["config_version"] == 2
+    assert replay["matched_rule"]["variant_key"] == "b"
+
+
+def test_delete_flag_removes_versions(client):
+    _versioned_flag(client)
+    assert client.delete("/api/v1/flags/ver_flag").status_code == 204
+    assert client.get("/api/v1/flags/ver_flag/versions").status_code == 404
+    # 同名重建后版本从 1 重新开始，不与历史版本冲突
+    payload = {
+        "flag_key": "ver_flag",
+        "variants": [{"key": "a", "weight": 100}, {"key": "b", "weight": 0}],
+        "rules": [],
+    }
+    resp = client.post("/api/v1/flags", json=payload)
+    assert resp.status_code == 201
+    assert resp.json()["version"] == 1
+    versions = client.get("/api/v1/flags/ver_flag/versions").json()
+    assert [v["version"] for v in versions] == [1]
